@@ -1,0 +1,255 @@
+using Distributions
+using Plots
+using Combinatorics: binomial
+using DelimitedFiles
+using ProgressMeter 
+
+# ========== Degree Distribution (Poisson) ==========
+function poisson_pk(ave_k, k)
+    pdf(Poisson(ave_k), k)  # Poisson distribution from Distributions.jl
+end
+function poisson_qm(ave_m, m)
+    pdf(Poisson(ave_m), m)  # Poisson distribution from Distributions.jl
+end
+
+# ========== Compute u (Activated Hyperedges) ==========
+function compute_u(ave_m, p_n, phi_m, w, m_max)
+    part1 = 0.0
+    for m in (phi_m+1):m_max
+        part2 = 0.0
+        for i in phi_m:(m-1)
+            part2 += binomial(m-1, i) * (w^i) * (1-w)^(m-1-i)
+        end
+        part1 += m * poisson_qm(ave_m, m)*(1-(1 - p_n)^m)/ave_m * part2
+    end
+    return part1 
+end
+
+# ========== Compute w (Intermediate Node Activation) ==========
+function compute_w(r0,u,ave_k, p_n, phi_k, k_max)
+    part1 = 0.0
+    for k in (phi_k+1):k_max
+        part2 = 0.0
+        for i in phi_k:(k-1)
+            part2 += binomial(k-1, i) * (u^i) * (1-u)^(k-1-i)
+        end
+        part1 += k * poisson_pk(ave_k, k)  / ave_k * part2
+    end
+    return p_n*(1-r0)*part1 + p_n*r0
+end
+
+# ========== Compute ra (Overall Activation Fraction) ==========
+function compute_ra(ave_m, p_n, phi_m, phi_k, ave_k, r0, m_max, k_max, max_iter, tol)
+    u = compute_u(ave_m, p_n, phi_m, r0, m_max)
+    converged = false
+    for _ in 1:max_iter
+        w_current = compute_w(r0, u, ave_k, p_n, phi_k, k_max)
+        u_new = compute_u(ave_m, p_n, phi_m, w_current, m_max)
+        if abs(u_new - u) < tol
+            u = u_new
+            converged = true 
+            break
+        end
+        u = u_new
+    end
+
+    if !converged
+        @warn "compute_ra: Maximum iterations reached without convergence" max_iter tol
+    end
+
+    # 3. Compute final w based on converged u
+    w_final = compute_w(r0, u, ave_k, p_n, phi_k, k_max)
+
+    # Compute final activation fraction r
+    part1 = 0.0
+    for k in phi_k:k_max
+        part2 = 0.0
+        for i in phi_k:k
+            part2 += binomial(k, i) * (u^i) * (1-u)^(k-i)
+        end
+        part1 +=  poisson_pk(ave_k, k)  * part2
+    end
+    ra = p_n * (1 - r0) * part1 + p_n * r0
+    return ra , u, w_final
+end
+
+
+# ========== Compute X1 (Activated Hyperedges Connected to Giant Component) ==========
+function compute_X1(ra,ave_m, p_n, phi_m,Y, m_max) 
+    
+    part1 = 0.0
+    for m in phi_m:m_max
+        part2 = 0.0
+        for l in (phi_m-1):(m-1)
+            part3 = 0.0
+            for i in 1:l
+                part3 += binomial(l, i) * (Y^i) * (ra-Y)^(l-i)
+            end
+            part2 += binomial(m-1, l)  * (1-ra)^(m-1-l) * part3
+        end
+        part1 += m * poisson_qm(ave_m, m)*(1-(1 - p_n)^m)/ave_m * part2
+    end
+    return part1 
+end
+
+# ========== Compute X2 (Activated Hyperedges Connected to Giant Component) ==========
+function compute_X2(ra,ave_m, p_n, phi_m,Y, m_max) 
+    
+    part1 = 0.0
+    for m in (phi_m+1):m_max
+        part2 = 0.0
+        for l in phi_m:(m-1)
+            part3 = 0.0
+            for i in 1:l
+                part3 += binomial(l, i) * (Y^i) * (ra-Y)^(l-i)
+            end
+            part2 += binomial(m-1, l)  * (1-ra)^(m-1-l) * part3
+        end
+        part1 += m * poisson_qm(ave_m, m)*(1-(1 - p_n)^m)/ave_m * part2
+    end
+    return part1 
+end
+
+# ========== Compute Y (Activated Nodes Connected to Giant Component) ==========
+function compute_Y(u, p_n,  phi_k, ave_k, r0, X1,X2, k_max)
+    
+    part1 = 0.0
+    for k in 2:k_max
+        part2 = 0.0
+        for i in 1:(k-1)
+            part2 += binomial(k-1, i) * (X1^i) * (1-X1)^(k-1-i)
+        end
+        part1 += k * poisson_pk(ave_k, k) / ave_k * part2
+    end
+    this = p_n*r0*part1
+
+    term1 = 0.0
+    for k in (phi_k+1):k_max
+        term2 = 0.0
+        for l in phi_k:(k-1)
+            term3 = 0.0
+            for i in 1:l
+                term3 += binomial(l, i) * (X2^i) * (u-X2)^(l-i)
+            end
+            term2 += binomial(k-1, l) * (1-u)^(k-1-l) * term3
+        end
+        term1 += k * poisson_pk(ave_k, k) / ave_k * term2
+    end
+    that = p_n*(1-r0)*term1
+    return this + that
+end
+
+# ========== Compute rgc (Giant Component Activation Fraction) ==========
+function compute_rgc(ave_m, p_n, phi_m, phi_k, ave_k, r0, m_max, k_max, max_iter, tol)
+    ra,u,_ = compute_ra(ave_m, p_n, phi_m, phi_k, ave_k, r0, m_max, k_max, max_iter, tol)
+    X1 = compute_X1(ra,ave_m, p_n, phi_m,r0, m_max)
+    X2 = compute_X2(ra,ave_m, p_n, phi_m,r0, m_max)
+    converged = false
+    for _ in 1:max_iter
+        Y_current = compute_Y(u, p_n,  phi_k, ave_k, r0, X1,X2, k_max)
+        X1_new = compute_X1(ra,ave_m, p_n, phi_m,Y_current, m_max)
+        X2_new = compute_X2(ra,ave_m, p_n, phi_m,Y_current, m_max)
+        if abs(X1_new - X1) < tol && abs(X2_new - X2) < tol
+            X1 = X1_new 
+            X2 = X2_new
+            converged = true
+            break
+        end
+        X1 = X1_new
+        X2 = X2_new
+        
+    end
+
+    if !converged
+        @warn "compute_rgc: Maximum iterations reached without convergence" max_iter tol
+    end
+    # 3. Compute final w based on converged u (commented out as in original)
+    # Y_final = compute_Y(ave_m, p_n, phi_m, phi_k, ave_k, r0, X,m_max, k_max, max_iter, tol)
+
+    # Compute final activation fraction of the giant component
+    part1 = 0.0
+    for k in 1:k_max
+        part2 = 0.0
+        for i in 1:k
+            part2 += binomial(k, i) * (X1^i) * (1-X1)^(k-i)
+        end
+        part1 += poisson_pk(ave_k, k)  * part2
+    end
+    this = p_n*r0*part1
+
+    term1 = 0.0
+    for k in phi_k:k_max
+        term2 = 0.0
+        for l in phi_k:k
+            term3 = 0.0
+            for i in 1:l
+                term3 += binomial(l, i) * (X2^i) * (u-X2)^(l-i)
+            end
+            term2 += binomial(k, l) * (1-u)^(k-l) * term3
+        end
+        term1 += poisson_pk(ave_k, k)  * term2
+    end
+    that = p_n*(1-r0)*term1
+    return this + that
+end
+
+# Parameter Settings
+ave_m = 20.0      # Average hyperedge size
+ave_k = 20.0      # Average node degree
+r0s = collect(0:0.01:1)  # Range of initial activation fractions
+p_n = 1        # Node participation probability
+phi_m = 12        # Hyperedge activation threshold
+phi_k = 12        # Node activation threshold
+m_max = 50       # Maximum hyperedge size
+k_max = 50       # Maximum node degree
+max_iter=2000    # Maximum number of iterations
+tol=1e-5         # Convergence tolerance
+
+overall_results =  zeros(length(r0s), 1)
+branch_results = zeros(length(r0s), 1)
+
+@showprogress "Running analytical computation..." for (i, r0) in enumerate(r0s)
+    ra, u, w = compute_ra(ave_m, p_n, phi_m, phi_k, ave_k, r0, m_max, k_max, max_iter, tol)
+    rgc = compute_rgc(ave_m, p_n, phi_m, phi_k, ave_k, r0, m_max, k_max, max_iter, tol)
+    
+    overall_results[i,1] = ra
+    branch_results[i,1] = rgc
+    
+end
+
+writedlm("./data/cal_all_ratial_r0_r.csv", overall_results)
+writedlm("./data/cal_branch_ratial_r0_r.csv", branch_results)
+
+# Create plot canvas, plot overall activation fraction first
+plt = plot(
+    r0s, overall_results,
+    label="all_ratial",  # Legend
+    xlabel="r0",  # X-axis label
+    ylabel="r",  # Y-axis label
+    title="cal_avem=$(ave_m),pn=$(p_n),phim=$(phi_m),phk=$(phi_k)",  # Plot title
+    linewidth=2,  # Line width
+    marker=:circle,  # Marker style
+    markersize=5,  # Marker size
+    color=:blue,  # Line color
+    grid=true,  # Show grid
+    legend=:bottomright,  # Legend position
+    xticks=0:0.2:1,  # X-axis ticks with 0.2 interval (from 0 to 1)
+    yticks=0:0.2:1   # Y-axis ticks with 0.2 interval (from 0 to 1)
+)
+
+# Add giant component activation fraction (overlay on the same plot with plot!)
+plot!(
+    plt, r0s, branch_results,
+    label="branch_ratial",
+    linewidth=2,
+    marker=:square,
+    markersize=5,
+    color=:red,
+    linestyle=:dash  # Dashed line for distinction
+)
+
+# Save figure (optional)
+savefig(plt, "./fig/cal_r0_r_avem=$(ave_m)_pn=$(p_n)_phim=$(phi_m)_phk=$(phi_k).png")
+
+# Display figure
+display(plt)
