@@ -1,0 +1,198 @@
+using Distributions
+using Random
+using Statistics
+using Plots
+using DataFrames
+using DataStructures
+using DelimitedFiles
+using ProgressMeter  # Import progress bar package
+
+# ========== Generate Hypergraph ==========
+function generate_hypergraph(N, M, ave_m)
+    # M = round(Int, ave_k * N / ave_m)  # Calculate number of hyperedges
+
+    hyper_edges = Vector{Vector{Int}}(undef, M)
+    node_to_hyperedges = [Int[] for _ in 1:N]
+
+    poisson_qm = Poisson(ave_m)
+    for e in 1:M
+        cardinality = max(rand(poisson_qm), 1)
+        nodes = randperm(N)[1:cardinality]
+        hyper_edges[e] = nodes
+        for n in nodes
+            push!(node_to_hyperedges[n], e)
+        end
+    end
+
+    return hyper_edges, node_to_hyperedges
+end
+
+# ========== Simulate Spreading Process ==========
+function simulate_spread(hyper_edges, node_to_hyperedges, r0, phi_m, phi_k, original_N, num_simulations)
+    overall_ratios = Float64[]
+    branch_ratios = Float64[]
+    N = original_N  # Keep all nodes
+    
+    for _ in 1:num_simulations
+        M = length(hyper_edges)
+        
+        # Initialize activated nodes (all nodes are eligible for activation)
+        num_activated = round(Int, r0 * N)
+        activation = zeros(Int, N)
+        
+        if num_activated > 0
+            activated_indices = randperm(N)[1:num_activated]
+            for idx in activated_indices
+                activation[idx] = 1
+            end
+        end
+        
+        # Synchronous update of activation states (spreading process)
+        activated_nodes = Set(findall(==(1), activation))
+        activated_edges = Set{Int}()
+        
+        while true
+            new_activated_nodes = Set{Int}()
+            new_activated_edges = Set{Int}()
+            
+            # Activate hyperedges
+            for e in 1:M
+                e in activated_edges && continue
+                nodes = hyper_edges[e]
+                active_count = sum(activation[n] for n in nodes)
+                if active_count >= phi_m
+                    push!(new_activated_edges, e)
+                end
+            end
+            
+            # Activate nodes
+            for n in 1:N
+                (activation[n] == 1) && continue  # Skip already activated nodes
+                active_edge_count = count(e -> e in activated_edges || e in new_activated_edges, node_to_hyperedges[n])
+                if active_edge_count >= phi_k
+                    push!(new_activated_nodes, n)
+                end
+            end
+            
+            # Terminate if no new activations (spreading reaches steady state)
+            if isempty(new_activated_nodes) && isempty(new_activated_edges)
+                break
+            end
+            
+            # Update activation states
+            for n in new_activated_nodes
+                activation[n] = 1
+                push!(activated_nodes, n)
+            end
+            union!(activated_edges, new_activated_edges)
+        end
+        
+        # After spreading stabilizes, compute activation ratio of all nodes
+        total_active = sum(activation)
+        overall_ratio = total_active / original_N
+        
+        # Largest activated connected component ratio
+        adj = [Set{Int}() for _ in 1:N]
+
+        for e in activated_edges
+            nodes = hyper_edges[e]
+            active_nodes_in_e = filter(n -> activation[n] == 1, nodes)
+            for i in 1:length(active_nodes_in_e)
+                for j in i+1:length(active_nodes_in_e)
+                    a, b = active_nodes_in_e[i], active_nodes_in_e[j]
+                    push!(adj[a], b)
+                    push!(adj[b], a)
+                end
+            end
+        end
+
+        visited = falses(N)
+        max_size = 0
+
+        for i in 1:N
+            if activation[i] == 1 && !visited[i]
+                queue = [i]
+                visited[i] = true
+                size_component = 1
+                while !isempty(queue)
+                    node = popfirst!(queue)
+                    for neighbor in adj[node]
+                        if !visited[neighbor]
+                            visited[neighbor] = true
+                            push!(queue, neighbor)
+                            size_component += 1
+                        end
+                    end
+                end
+                max_size = max(max_size, size_component)
+            end
+        end
+        branch_ratio = max_size / original_N
+        push!(overall_ratios, overall_ratio)
+        push!(branch_ratios, branch_ratio)
+    end
+    
+    return mean(overall_ratios), mean(branch_ratios)
+end
+
+# ========== Parameter Settings ==========
+N = 2000            # Number of nodes
+M = 2000            # Number of hyperedges
+ave_m = 20           # Average hyperedge cardinality
+p_n =  1           # Node retention probability
+phi_m = 12           # Hyperedge activation threshold
+phi_k = 12         # Node activation threshold
+r0s = collect(0:0.01:1)  # Range of initial activation fractions
+num_simulations = 20  # Number of simulation runs
+
+
+overall_results =  zeros(length(r0s), 1)
+branch_results = zeros(length(r0s), 1)
+
+@showprogress "Running simulation..." for (i, r0) in enumerate(r0s)
+    # Generate hypergraph
+    hyper_edges, node_to_hyperedges = generate_hypergraph(N, M, ave_m)
+        
+    # Simulate spreading directly on the original hypergraph
+    overall_ratio, branch_ratio = simulate_spread(hyper_edges, node_to_hyperedges, r0, phi_m, phi_k, N, num_simulations)
+    
+    overall_results[i, 1] = overall_ratio
+    branch_results[i, 1] = branch_ratio
+end
+
+writedlm("./data/simu_all_ratial_r0_r.csv", overall_results)
+writedlm("./data/simu_branch_ratial_r0_r.csv", branch_results)
+
+# Create plot canvas, plot overall activation ratio first
+plt = plot(
+    r0s, overall_results,
+    label="all_ratial",  # Legend
+    xlabel="r0",  # X-axis label
+    ylabel="r",  # Y-axis label
+    title="simu_avem=$(ave_m),pn=$(p_n),phim=$(phi_m),phk=$(phi_k)",  # Plot title
+    linewidth=2,  # Line width
+    marker=:circle,  # Marker style
+    markersize=5,  # Marker size
+    color=:blue,  # Line color
+    grid=true,  # Show grid
+    legend=:bottomright,  # Legend position
+    xticks=0:0.2:1,  # X-axis ticks with 0.2 interval (from 0 to 1)
+    yticks=0:0.2:1   # Y-axis ticks with 0.2 interval (from 0 to 1)
+)
+
+# Add largest component activation ratio (overlay on the same plot with plot!)
+plot!(
+    plt, r0s, branch_results,
+    label="branch_ratial",
+    linewidth=2,
+    marker=:square,
+    markersize=5,
+    color=:red,
+    linestyle=:dash  # Dashed line for distinction
+)
+
+# Save figure (optional)
+savefig(plt, "./fig/simu_r0_r_avem=$(ave_m)_pn=$(p_n)_phim=$(phi_m)_phk=$(phi_k).png")
+
+# Display figure
+display(plt)
